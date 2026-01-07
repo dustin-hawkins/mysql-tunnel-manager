@@ -1,0 +1,460 @@
+#!/bin/bash
+
+# MySQL SSH Tunnel Manager
+# Manages autossh tunnels to remote MySQL servers
+
+set -uo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/tunnels.conf}"
+PID_DIR="${PID_DIR:-/var/run/autossh}"
+LOG_DIR="${LOG_DIR:-/var/log/autossh}"
+LOG_FILE="${LOG_DIR}/tunnel-manager.log"
+
+# Bootstrap directories
+bootstrap_directories() {
+    local need_sudo=0
+    local dirs_to_create=()
+    
+    # Check if directories need to be created
+    if [[ ! -d "$PID_DIR" ]]; then
+        dirs_to_create+=("$PID_DIR")
+        # Check if we need sudo (parent directory not writable)
+        if [[ ! -w "$(dirname "$PID_DIR")" ]]; then
+            need_sudo=1
+        fi
+    elif [[ ! -w "$PID_DIR" ]]; then
+        need_sudo=1
+    fi
+    
+    if [[ ! -d "$LOG_DIR" ]]; then
+        dirs_to_create+=("$LOG_DIR")
+        # Check if we need sudo (parent directory not writable)
+        if [[ ! -w "$(dirname "$LOG_DIR")" ]]; then
+            need_sudo=1
+        fi
+    elif [[ ! -w "$LOG_DIR" ]]; then
+        need_sudo=1
+    fi
+    
+    # Create directories if needed
+    if [[ ${#dirs_to_create[@]} -gt 0 ]]; then
+        if [[ $need_sudo -eq 1 ]]; then
+            echo "Creating directories with sudo: ${dirs_to_create[*]}"
+            sudo mkdir -p "${dirs_to_create[@]}"
+            sudo chown "$USER:$USER" "${dirs_to_create[@]}"
+            sudo chmod 755 "${dirs_to_create[@]}"
+        else
+            echo "Creating directories: ${dirs_to_create[*]}"
+            mkdir -p "${dirs_to_create[@]}"
+        fi
+    fi
+    
+    # Fix permissions if directories exist but aren't writable
+    if [[ $need_sudo -eq 1 ]]; then
+        if [[ -d "$PID_DIR" ]] && [[ ! -w "$PID_DIR" ]]; then
+            echo "Fixing permissions on $PID_DIR"
+            sudo chown "$USER:$USER" "$PID_DIR"
+            sudo chmod 755 "$PID_DIR"
+        fi
+        if [[ -d "$LOG_DIR" ]] && [[ ! -w "$LOG_DIR" ]]; then
+            echo "Fixing permissions on $LOG_DIR"
+            sudo chown "$USER:$USER" "$LOG_DIR"
+            sudo chmod 755 "$LOG_DIR"
+        fi
+    fi
+    
+    # Verify directories are now writable
+    if [[ ! -w "$PID_DIR" ]]; then
+        echo "ERROR: PID directory is not writable: $PID_DIR" >&2
+        exit 1
+    fi
+    
+    if [[ ! -w "$LOG_DIR" ]]; then
+        echo "ERROR: Log directory is not writable: $LOG_DIR" >&2
+        exit 1
+    fi
+}
+
+# Bootstrap on startup
+bootstrap_directories
+
+# Logging function
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" | tee -a "$LOG_FILE" >&2
+}
+
+# Check if tunnel is running
+is_running() {
+    local pid_file="$1"
+    
+    if [[ ! -f "$pid_file" ]]; then
+        return 1
+    fi
+    
+    local pid
+    pid=$(cat "$pid_file")
+    
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    else
+        # Stale PID file
+        rm -f "$pid_file"
+        return 1
+    fi
+}
+
+# Stop a specific tunnel
+stop_tunnel() {
+    local name="$1"
+    local pid_file="${PID_DIR}/${name}.pid"
+    
+    if ! is_running "$pid_file"; then
+        log "Tunnel '$name' is not running"
+        return 0
+    fi
+    
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null || echo "")
+    
+    if [[ -z "$pid" ]]; then
+        log "Warning: Empty PID file for '$name'"
+        rm -f "$pid_file"
+        return 0
+    fi
+    
+    log "Stopping tunnel '$name' (PID: $pid)"
+    
+    # Kill autossh (which will kill ssh)
+    if kill "$pid" 2>/dev/null; then
+        # Wait for process to terminate
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [[ $count -lt 10 ]]; do
+            sleep 0.5
+            ((count++))
+        done
+        
+        # Force kill if still running
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Force killing tunnel '$name'"
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 0.5
+        fi
+        
+        rm -f "$pid_file"
+        log "Tunnel '$name' stopped successfully"
+        return 0
+    else
+        # Process already dead
+        log "Process for tunnel '$name' already terminated"
+        rm -f "$pid_file"
+        return 0
+    fi
+}
+
+# Start a specific tunnel
+start_tunnel() {
+    local name="$1"
+    local local_port="$2"
+    local remote_host="$3"
+    local remote_port="${4:-3306}"
+    local ssh_host="$5"
+    local ssh_opts="${6:-}"
+    
+    local pid_file="${PID_DIR}/${name}.pid"
+    local tunnel_log="${LOG_DIR}/${name}.log"
+    
+    # Check if already running
+    if is_running "$pid_file"; then
+        log "Tunnel '$name' is already running (PID: $(cat "$pid_file"))"
+        return 0
+    fi
+    
+    log "Starting tunnel '$name': localhost:${local_port} -> ${ssh_host} -> ${remote_host}:${remote_port}"
+    
+    # Set autossh environment
+    export AUTOSSH_PIDFILE="$pid_file"
+    export AUTOSSH_LOGFILE="$tunnel_log"
+    export AUTOSSH_POLL=30
+    export AUTOSSH_GATETIME=0
+    
+    # Build SSH command
+    local ssh_cmd="autossh -f -N -M 0"
+    ssh_cmd+=" -o ServerAliveInterval=30"
+    ssh_cmd+=" -o ServerAliveCountMax=3"
+    ssh_cmd+=" -o ExitOnForwardFailure=yes"
+    ssh_cmd+=" -o StrictHostKeyChecking=no"
+    
+    # Add custom SSH options if provided
+    if [[ -n "$ssh_opts" ]]; then
+        ssh_cmd+=" $ssh_opts"
+    fi
+    
+    ssh_cmd+=" -L ${local_port}:${remote_host}:${remote_port}"
+    ssh_cmd+=" ${ssh_host}"
+    
+    # Start the tunnel
+    if eval "$ssh_cmd"; then
+        # Wait a moment and verify it started
+        sleep 1
+        if is_running "$pid_file"; then
+            log "Tunnel '$name' started successfully (PID: $(cat "$pid_file"))"
+            return 0
+        else
+            log_error "Tunnel '$name' failed to start (check $tunnel_log)"
+            return 1
+        fi
+    else
+        log_error "Failed to execute autossh for tunnel '$name'"
+        return 1
+    fi
+}
+
+# Restart a specific tunnel
+restart_tunnel() {
+    local name="$1"
+    shift
+    
+    log "Restarting tunnel '$name'"
+    stop_tunnel "$name"
+    sleep 1
+    start_tunnel "$name" "$@"
+}
+
+# Status of all tunnels
+status_tunnels() {
+    log "Checking tunnel status..."
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration file not found: $CONFIG_FILE"
+        return 1
+    fi
+    
+    local all_running=0
+    
+    while IFS='|' read -r name local_port remote_host remote_port ssh_host ssh_opts; do
+        # Skip comments and empty lines
+        [[ "$name" =~ ^#.*$ ]] || [[ -z "$name" ]] && continue
+        
+        # Trim whitespace
+        name=$(echo "$name" | xargs)
+        
+        local pid_file="${PID_DIR}/${name}.pid"
+        
+        if is_running "$pid_file"; then
+            local pid=$(cat "$pid_file")
+            echo "✓ $name: RUNNING (PID: $pid, Port: $local_port)"
+        else
+            echo "✗ $name: STOPPED (Port: $local_port)"
+            all_running=1
+        fi
+    done < "$CONFIG_FILE"
+    
+    return $all_running
+}
+
+# Start all tunnels from config
+start_all() {
+    log "Starting all tunnels from $CONFIG_FILE"
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration file not found: $CONFIG_FILE"
+        return 1
+    fi
+    
+    while IFS='|' read -r name local_port remote_host remote_port ssh_host ssh_opts; do
+        # Skip comments and empty lines
+        [[ "$name" =~ ^#.*$ ]] || [[ -z "$name" ]] && continue
+        
+        # Trim whitespace
+        name=$(echo "$name" | xargs)
+        local_port=$(echo "$local_port" | xargs)
+        remote_host=$(echo "$remote_host" | xargs)
+        remote_port=$(echo "${remote_port:-3306}" | xargs)
+        ssh_host=$(echo "$ssh_host" | xargs)
+        ssh_opts=$(echo "${ssh_opts:-}" | xargs)
+        
+        start_tunnel "$name" "$local_port" "$remote_host" "$remote_port" "$ssh_host" "$ssh_opts"
+    done < "$CONFIG_FILE"
+}
+
+# Stop all tunnels
+stop_all() {
+    log "Stopping all tunnels"
+    
+    local pids_to_wait=()
+    local names=()
+    
+    # First pass: collect all running PIDs and names
+    for pid_file in "$PID_DIR"/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        local name=$(basename "$pid_file" .pid)
+        
+        if is_running "$pid_file"; then
+            local pid=$(cat "$pid_file" 2>/dev/null || echo "")
+            if [[ -n "$pid" ]]; then
+                pids_to_wait+=("$pid")
+                names+=("$name")
+            fi
+        fi
+    done
+    
+    # Second pass: stop all tunnels
+    for name in "${names[@]}"; do
+        stop_tunnel "$name" || true
+    done
+    
+    # Wait for all processes to actually terminate
+    log "Waiting for ${#pids_to_wait[@]} tunnel(s) to terminate..."
+    for pid in "${pids_to_wait[@]}"; do
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [[ $count -lt 20 ]]; do
+            sleep 0.5
+            ((count++))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Warning: PID $pid still running after 10 seconds"
+        fi
+    done
+    log "All tunnels terminated"
+}
+
+# Restart all tunnels
+restart_all() {
+    log "Restarting all tunnels"
+    stop_all
+    log "All tunnels stopped, waiting before restart..."
+    sleep 1
+    start_all
+}
+
+# Show usage
+usage() {
+    cat <<EOF
+MySQL SSH Tunnel Manager
+
+Usage: $0 {start|stop|restart|status} [tunnel-name]
+
+Commands:
+    start [name]    - Start all tunnels or specific tunnel
+    stop [name]     - Stop all tunnels or specific tunnel
+    restart [name]  - Restart all tunnels or specific tunnel
+    status          - Show status of all tunnels
+
+Configuration:
+    Config file: $CONFIG_FILE
+    PID directory: $PID_DIR
+    Log directory: $LOG_DIR
+
+Environment variables:
+    CONFIG_FILE - Path to configuration file
+    PID_DIR     - Directory for PID files
+    LOG_DIR     - Directory for log files
+
+EOF
+    exit 1
+}
+
+# Main logic
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+    fi
+    
+    local action="$1"
+    shift
+    
+    case "$action" in
+        start)
+            if [[ $# -eq 0 ]]; then
+                start_all
+            else
+                local name="$1"
+                # Read config for this tunnel
+                if [[ ! -f "$CONFIG_FILE" ]]; then
+                    log_error "Configuration file not found: $CONFIG_FILE"
+                    exit 1
+                fi
+                
+                local found=0
+                while IFS='|' read -r cfg_name local_port remote_host remote_port ssh_host ssh_opts; do
+                    [[ "$cfg_name" =~ ^#.*$ ]] || [[ -z "$cfg_name" ]] && continue
+                    cfg_name=$(echo "$cfg_name" | xargs)
+                    
+                    if [[ "$cfg_name" == "$name" ]]; then
+                        local_port=$(echo "$local_port" | xargs)
+                        remote_host=$(echo "$remote_host" | xargs)
+                        remote_port=$(echo "${remote_port:-3306}" | xargs)
+                        ssh_host=$(echo "$ssh_host" | xargs)
+                        ssh_opts=$(echo "${ssh_opts:-}" | xargs)
+                        
+                        start_tunnel "$name" "$local_port" "$remote_host" "$remote_port" "$ssh_host" "$ssh_opts"
+                        found=1
+                        break
+                    fi
+                done < "$CONFIG_FILE"
+                
+                if [[ $found -eq 0 ]]; then
+                    log_error "Tunnel '$name' not found in configuration"
+                    exit 1
+                fi
+            fi
+            ;;
+        stop)
+            if [[ $# -eq 0 ]]; then
+                stop_all
+            else
+                stop_tunnel "$1"
+            fi
+            ;;
+        restart)
+            if [[ $# -eq 0 ]]; then
+                restart_all
+            else
+                local name="$1"
+                # Read config for this tunnel
+                if [[ ! -f "$CONFIG_FILE" ]]; then
+                    log_error "Configuration file not found: $CONFIG_FILE"
+                    exit 1
+                fi
+                
+                local found=0
+                while IFS='|' read -r cfg_name local_port remote_host remote_port ssh_host ssh_opts; do
+                    [[ "$cfg_name" =~ ^#.*$ ]] || [[ -z "$cfg_name" ]] && continue
+                    cfg_name=$(echo "$cfg_name" | xargs)
+                    
+                    if [[ "$cfg_name" == "$name" ]]; then
+                        local_port=$(echo "$local_port" | xargs)
+                        remote_host=$(echo "$remote_host" | xargs)
+                        remote_port=$(echo "${remote_port:-3306}" | xargs)
+                        ssh_host=$(echo "$ssh_host" | xargs)
+                        ssh_opts=$(echo "${ssh_opts:-}" | xargs)
+                        
+                        restart_tunnel "$name" "$local_port" "$remote_host" "$remote_port" "$ssh_host" "$ssh_opts"
+                        found=1
+                        break
+                    fi
+                done < "$CONFIG_FILE"
+                
+                if [[ $found -eq 0 ]]; then
+                    log_error "Tunnel '$name' not found in configuration"
+                    exit 1
+                fi
+            fi
+            ;;
+        status)
+            status_tunnels
+            ;;
+        *)
+            log_error "Unknown action: $action"
+            usage
+            ;;
+    esac
+}
+
+main "$@"
