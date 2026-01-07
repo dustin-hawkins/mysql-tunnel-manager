@@ -154,5 +154,149 @@ LOG_DIR=~/tunnels/logs ./tunnels.sh start
 ```
 
 **Defaults:**
-- `CONFIG_
-# sqlyog-ssh-tunnels
+- `CONFIG_FILE`: `./tunnels.conf` (in script directory)
+- `PID_DIR`: `/var/run/autossh`
+- `LOG_DIR`: `/var/log/autossh`
+
+## Connecting to Your Databases
+
+Once tunnels are running, connect to your databases via localhost:
+
+```bash
+# Connect to gce-db-3 (port 33303)
+mysql -h 127.0.0.1 -P 33303 -u dbuser -p
+
+# Connect to gce-db-4 (port 33304)
+mysql -h 127.0.0.1 -P 33304 -u dbuser -p
+```
+
+Or use MySQL Workbench, DBeaver, or any other client with:
+- **Host**: 127.0.0.1
+- **Port**: 33303 (or your configured port)
+- **Username/Password**: Your remote database credentials
+
+## Directory Structure
+
+```
+mysql-tunnel-manager/
+├── tunnels.sh          # Main script
+├── tunnels.conf        # Tunnel configuration
+├── README.md           # This file
+├── /var/run/autossh/   # PID files (auto-created)
+│   ├── gce-db-3.pid
+│   └── gce-db-4.pid
+└── /var/log/autossh/   # Log files (auto-created)
+    ├── tunnel-manager.log
+    ├── gce-db-3.log
+    └── gce-db-4.log
+```
+
+## Troubleshooting
+
+### Tunnel won't start
+
+Check the tunnel-specific log:
+```bash
+tail -f /var/log/autossh/gce-db-3.log
+```
+
+Common issues:
+- SSH host not reachable (VPN down?)
+- SSH authentication failure (check keys)
+- Port already in use locally
+- Remote port not accessible
+
+### Check main manager log
+
+```bash
+tail -f /var/log/autossh/tunnel-manager.log
+```
+
+### Verify SSH connection manually
+
+```bash
+ssh -v gce-db-3
+```
+
+### Check if port is already in use
+
+```bash
+lsof -i :33303
+```
+
+### Force cleanup
+
+If you have stale processes:
+```bash
+pkill -f autossh
+rm /var/run/autossh/*.pid
+./tunnels.sh start
+```
+
+## Requirements
+
+- `autossh` - Install with:
+  - Ubuntu/Debian: `sudo apt-get install autossh`
+  - CentOS/RHEL: `sudo yum install autossh`
+  - macOS: `brew install autossh`
+- `bash` 4.0 or higher
+- SSH access to remote servers
+- `sudo` access for initial directory setup (if using default locations)
+
+## How It Works
+
+1. **autossh** maintains persistent SSH tunnels with automatic reconnection
+2. **Port forwarding** maps local ports to remote MySQL servers
+3. **PID files** track running processes and prevent duplicates
+4. **Health checks** use SSH ServerAliveInterval to detect dead connections
+5. **Graceful shutdown** ensures ports are freed before restart
+
+The script uses autossh's built-in monitoring (ServerAliveInterval) rather than the legacy `-M` monitor port, which is more reliable and doesn't require extra port allocation.
+
+## systemd Integration (Optional)
+
+To run tunnels as a system service, create `/etc/systemd/system/mysql-tunnels.service`:
+
+```ini
+[Unit]
+Description=MySQL SSH Tunnel Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=your-username
+WorkingDirectory=/path/to/mysql-tunnel-manager
+ExecStart=/path/to/mysql-tunnel-manager/tunnels.sh start
+ExecStop=/path/to/mysql-tunnel-manager/tunnels.sh stop
+ExecReload=/path/to/mysql-tunnel-manager/tunnels.sh restart
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mysql-tunnels
+sudo systemctl start mysql-tunnels
+sudo systemctl status mysql-tunnels
+```
+
+## License
+
+MIT License - feel free to use and modify as needed.
+
+## Contributing
+
+Pull requests welcome! Please ensure:
+- Code follows existing style
+- Changes are tested with multiple tunnels
+- README is updated for new features
+
+## Author
+
+Created for managing ESP database infrastructure and job board platforms with reliable tunnel connections.
