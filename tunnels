@@ -9,7 +9,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/tunnels.conf}"
 PID_DIR="${PID_DIR:-/var/run/autossh}"
-LOG_DIR="${LOG_DIR:-/var/log/autossh}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 LOG_FILE="${LOG_DIR}/tunnel-manager.log"
 
 # Bootstrap directories
@@ -157,6 +157,62 @@ stop_tunnel() {
     fi
 }
 
+# Extract SSH port from ssh_opts string (-p flag), defaulting to 22
+get_ssh_port() {
+    local ssh_opts="${1:-}"
+    local port=22
+    if [[ "$ssh_opts" =~ -p[[:space:]]+([0-9]+) ]]; then
+        port="${BASH_REMATCH[1]}"
+    fi
+    echo "$port"
+}
+
+# Returns 0 if host:port is reachable within timeout seconds
+is_host_reachable() {
+    local host="$1"
+    local port="${2:-22}"
+    local timeout="${3:-5}"
+
+    if command -v nc &>/dev/null; then
+        nc -z -w "$timeout" "$host" "$port" &>/dev/null
+    else
+        timeout "$timeout" bash -c ">/dev/tcp/${host}/${port}" &>/dev/null 2>&1
+    fi
+}
+
+# Verify SSH agent has keys loaded, or that an explicit identity file exists
+check_ssh_agent() {
+    local ssh_opts="${1:-}"
+
+    # If -i key file is specified, verify the file exists and is readable
+    if [[ "$ssh_opts" =~ -i[[:space:]]+([^[:space:]]+) ]]; then
+        local key_file="${BASH_REMATCH[1]/#\~/$HOME}"
+        if [[ ! -f "$key_file" ]]; then
+            log_error "SSH identity file not found: $key_file"
+            return 1
+        fi
+        if [[ ! -r "$key_file" ]]; then
+            log_error "SSH identity file not readable: $key_file"
+            return 1
+        fi
+        return 0
+    fi
+
+    # No explicit key — check the SSH agent
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+        log_error "SSH agent not running (SSH_AUTH_SOCK not set) — start ssh-agent and run ssh-add"
+        return 1
+    fi
+
+    local rc
+    ssh-add -l &>/dev/null; rc=$?
+    case $rc in
+        0) return 0 ;;
+        1) log_error "SSH agent has no keys loaded — run: ssh-add"; return 1 ;;
+        2) log_error "Cannot connect to SSH agent (stale SSH_AUTH_SOCK?)"; return 1 ;;
+    esac
+}
+
 # Start a specific tunnel
 start_tunnel() {
     local name="$1"
@@ -174,7 +230,20 @@ start_tunnel() {
         log "Tunnel '$name' is already running (PID: $(cat "$pid_file"))"
         return 0
     fi
-    
+
+    # Pre-flight: verify SSH agent/key
+    if ! check_ssh_agent "$ssh_opts"; then
+        return 1
+    fi
+
+    # Pre-flight: verify host is reachable (catches VPN-gated hosts)
+    local ssh_port
+    ssh_port=$(get_ssh_port "$ssh_opts")
+    if ! is_host_reachable "$ssh_host" "$ssh_port" 5; then
+        log_error "Cannot reach '$ssh_host' on port $ssh_port — is VPN connected?"
+        return 1
+    fi
+
     log "Starting tunnel '$name': localhost:${local_port} -> ${ssh_host} -> ${remote_host}:${remote_port}"
     
     # Set autossh environment
@@ -226,35 +295,90 @@ restart_tunnel() {
     start_tunnel "$name" "$@"
 }
 
+# Inspect autossh log file for connection errors or status
+inspect_tunnel_log() {
+    local tunnel_log="$1"
+
+    [[ -f "$tunnel_log" ]] || return 0
+
+    local recent
+    recent=$(tail -n 100 "$tunnel_log" 2>/dev/null)
+
+    [[ -n "$recent" ]] || return 0
+
+    # Check for known error patterns (most specific first)
+    if echo "$recent" | grep -qi "permission denied"; then
+        echo "auth failed: permission denied (check SSH key/agent)"
+    elif echo "$recent" | grep -qi "no such identity\|identity file.*no such file"; then
+        echo "key error: SSH identity file not found"
+    elif echo "$recent" | grep -qi "agent has no identities\|no identities"; then
+        echo "SSH agent has no keys loaded (run ssh-add)"
+    elif echo "$recent" | grep -qi "agent admitted failure\|sign_and_send_pubkey"; then
+        echo "SSH agent error: agent cannot sign with available key"
+    elif echo "$recent" | grep -qi "could not resolve hostname\|name or service not known"; then
+        echo "DNS error: cannot resolve hostname"
+    elif echo "$recent" | grep -qi "connection refused"; then
+        echo "connection refused: SSH port not open on remote"
+    elif echo "$recent" | grep -qi "connection timed out\|no route to host\|network is unreachable"; then
+        echo "network error: host unreachable"
+    elif echo "$recent" | grep -qi "bind.*address already in use"; then
+        echo "port conflict: local port already in use"
+    elif echo "$recent" | grep -qi "channel.*open failed\|forwarding.*failed\|remote port forwarding failed"; then
+        echo "tunnel error: remote port forwarding failed"
+    elif echo "$recent" | grep -qi "not restarting"; then
+        echo "autossh gave up restarting (see log)"
+    fi
+}
+
 # Status of all tunnels
 status_tunnels() {
     log "Checking tunnel status..."
-    
+
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration file not found: $CONFIG_FILE"
         return 1
     fi
-    
+
     local all_running=0
-    
+
     while IFS='|' read -r name local_port remote_host remote_port ssh_host ssh_opts; do
         # Skip comments and empty lines
         [[ "$name" =~ ^#.*$ ]] || [[ -z "$name" ]] && continue
-        
+
         # Trim whitespace
         name=$(echo "$name" | xargs)
-        
+        ssh_host=$(echo "$ssh_host" | xargs)
+        ssh_opts=$(echo "${ssh_opts:-}" | xargs)
+
         local pid_file="${PID_DIR}/${name}.pid"
-        
+        local tunnel_log="${LOG_DIR}/${name}.log"
+        local log_issue
+        log_issue=$(inspect_tunnel_log "$tunnel_log")
+
         if is_running "$pid_file"; then
             local pid=$(cat "$pid_file")
-            echo "✓ $name: RUNNING (PID: $pid, Port: $local_port)"
+            if [[ -n "$log_issue" ]]; then
+                echo "~ $name: RUNNING w/ ERRORS (PID: $pid, Port: $local_port) — $log_issue"
+            else
+                echo "✓ $name: RUNNING (PID: $pid, Port: $local_port)"
+            fi
         else
-            echo "✗ $name: STOPPED (Port: $local_port)"
+            # Check if the host is even reachable (VPN may be down)
+            local ssh_port reach_note=""
+            ssh_port=$(get_ssh_port "$ssh_opts")
+            if ! is_host_reachable "$ssh_host" "$ssh_port" 3; then
+                reach_note=" [host unreachable — VPN connected?]"
+            fi
+
+            if [[ -n "$log_issue" ]]; then
+                echo "✗ $name: STOPPED (Port: $local_port)${reach_note} — $log_issue"
+            else
+                echo "✗ $name: STOPPED (Port: $local_port)${reach_note} — check $tunnel_log for details"
+            fi
             all_running=1
         fi
     done < "$CONFIG_FILE"
-    
+
     return $all_running
 }
 
